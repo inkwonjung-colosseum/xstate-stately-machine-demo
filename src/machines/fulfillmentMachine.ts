@@ -3,13 +3,15 @@ import { createMachine } from 'xstate';
 export const fulfillmentMachine = createMachine({
   id: 'enterpriseFulfillment',
   description:
-    'Import-friendly warehouse fulfillment workflow for testing Stately Studio GitHub import.',
+    'Detailed warehouse fulfillment workflow for Stately Studio simulation and GitHub import testing.',
   initial: 'intake',
   context: {
     orderId: null,
-    riskScore: 0,
-    pickExceptions: 0,
+    customerId: null,
+    waveId: null,
+    parcelId: null,
     labelAttempts: 0,
+    exceptionCount: 0,
   },
   on: {
     CUSTOMER_CANCELS: {
@@ -23,55 +25,62 @@ export const fulfillmentMachine = createMachine({
   },
   states: {
     intake: {
-      description: 'Receive, validate, and approve an order.',
-      initial: 'received',
+      description:
+        'Capture the order, normalize it, validate business rules, and complete risk review.',
+      initial: 'capturingOrder',
       states: {
-        received: {
+        capturingOrder: {
           entry: 'recordOrderReceived',
           on: {
-            VALIDATE_ORDER: 'validating',
+            ORDER_CAPTURED: 'normalizingPayload',
           },
         },
-        validating: {
+        normalizingPayload: {
           on: {
-            ORDER_VALID: 'riskCheck',
-            ORDER_INVALID: 'rejected',
+            PAYLOAD_NORMALIZED: 'validatingSchema',
+            PAYLOAD_MALFORMED: '#enterpriseFulfillment.failed',
           },
         },
-        riskCheck: {
+        validatingSchema: {
           on: {
-            LOW_RISK: 'accepted',
-            HIGH_RISK: 'manualFraudReview',
+            SCHEMA_VALID: 'enrichingCustomer',
+            SCHEMA_INVALID: '#enterpriseFulfillment.failed',
+          },
+        },
+        enrichingCustomer: {
+          on: {
+            CUSTOMER_ENRICHED: 'checkingFraudRisk',
+            CUSTOMER_NOT_FOUND: 'manualCustomerReview',
+          },
+        },
+        manualCustomerReview: {
+          on: {
+            CUSTOMER_APPROVED: 'checkingFraudRisk',
+            CUSTOMER_REJECTED: '#enterpriseFulfillment.cancelled',
+          },
+        },
+        checkingFraudRisk: {
+          on: {
+            RISK_ACCEPTABLE: 'accepted',
+            RISK_REVIEW_REQUIRED: 'manualFraudReview',
           },
         },
         manualFraudReview: {
           on: {
             APPROVE_RISK: 'accepted',
-            REJECT_RISK: 'rejected',
+            REJECT_RISK: '#enterpriseFulfillment.cancelled',
           },
         },
         accepted: {
           type: 'final',
           entry: 'publishOrderAccepted',
         },
-        rejected: {
-          type: 'final',
-          entry: 'publishOrderRejected',
-        },
       },
-      onDone: [
-        {
-          guard: 'orderWasRejected',
-          target: 'failed',
-        },
-        {
-          target: 'planning',
-        },
-      ],
+      onDone: 'planning',
     },
     planning: {
       description:
-        'Reserve inventory and authorize payment in parallel before warehouse work starts.',
+        'Reserve inventory, authorize payment, and prepare warehouse execution in parallel.',
       type: 'parallel',
       states: {
         inventory: {
@@ -79,7 +88,7 @@ export const fulfillmentMachine = createMachine({
           states: {
             checkingAvailability: {
               on: {
-                INVENTORY_AVAILABLE: 'reservingStock',
+                INVENTORY_AVAILABLE: 'holdingStock',
                 INVENTORY_SHORT: 'waitingForReplenishment',
                 INVENTORY_LOOKUP_FAILED: 'inventoryServiceUnavailable',
               },
@@ -95,10 +104,28 @@ export const fulfillmentMachine = createMachine({
                 BACKORDER_TIMEOUT: '#enterpriseFulfillment.failed',
               },
             },
-            reservingStock: {
+            holdingStock: {
               on: {
-                STOCK_RESERVED: 'reserved',
-                RESERVATION_CONFLICT: 'reservationConflict',
+                STOCK_HELD: 'allocatingBins',
+                HOLD_CONFLICT: 'reservationConflict',
+              },
+            },
+            allocatingBins: {
+              on: {
+                BINS_ALLOCATED: 'checkingSplitShipment',
+                BIN_ALLOCATION_FAILED: 'reservationConflict',
+              },
+            },
+            checkingSplitShipment: {
+              on: {
+                SINGLE_SHIPMENT: 'reserved',
+                SPLIT_SHIPMENT_REQUIRED: 'creatingSplitPlan',
+              },
+            },
+            creatingSplitPlan: {
+              on: {
+                SPLIT_PLAN_CREATED: 'reserved',
+                SPLIT_PLAN_FAILED: '#enterpriseFulfillment.failed',
               },
             },
             reservationConflict: {
@@ -117,8 +144,9 @@ export const fulfillmentMachine = createMachine({
           states: {
             authorizing: {
               on: {
-                PAYMENT_AUTHORIZED: 'authorized',
+                PAYMENT_AUTHORIZED: 'fraudLiabilityCheck',
                 PAYMENT_ACTION_REQUIRED: 'requiresCustomerAction',
+                PAYMENT_DECLINED: '#enterpriseFulfillment.cancelled',
               },
             },
             requiresCustomerAction: {
@@ -127,7 +155,39 @@ export const fulfillmentMachine = createMachine({
                 PAYMENT_WINDOW_EXPIRED: '#enterpriseFulfillment.cancelled',
               },
             },
+            fraudLiabilityCheck: {
+              on: {
+                LIABILITY_ACCEPTED: 'authorized',
+                LIABILITY_REVIEW_REQUIRED: 'manualPaymentReview',
+              },
+            },
+            manualPaymentReview: {
+              on: {
+                PAYMENT_REVIEW_APPROVED: 'authorized',
+                PAYMENT_REVIEW_REJECTED: '#enterpriseFulfillment.cancelled',
+              },
+            },
             authorized: {
+              type: 'final',
+            },
+          },
+        },
+        warehousePrep: {
+          initial: 'selectingWarehouse',
+          states: {
+            selectingWarehouse: {
+              on: {
+                WAREHOUSE_SELECTED: 'creatingWave',
+                NO_WAREHOUSE_CAPACITY: '#enterpriseFulfillment.failed',
+              },
+            },
+            creatingWave: {
+              on: {
+                WAVE_CREATED: 'ready',
+                WAVE_CREATE_FAILED: '#enterpriseFulfillment.failed',
+              },
+            },
+            ready: {
               type: 'final',
             },
           },
@@ -139,12 +199,19 @@ export const fulfillmentMachine = createMachine({
       },
     },
     picking: {
-      description: 'Assign warehouse work and resolve scan exceptions.',
+      description:
+        'Release the wave, assign work, scan stock, confirm quantities, and close pick tasks.',
       initial: 'waveQueued',
       states: {
         waveQueued: {
           on: {
-            WAVE_RELEASED: 'assigningPicker',
+            WAVE_RELEASED: 'optimizingRoute',
+          },
+        },
+        optimizingRoute: {
+          on: {
+            ROUTE_OPTIMIZED: 'assigningPicker',
+            ROUTE_OPTIMIZATION_FAILED: 'supervisorReview',
           },
         },
         assigningPicker: {
@@ -154,31 +221,49 @@ export const fulfillmentMachine = createMachine({
           },
         },
         inProgress: {
-          initial: 'scanningLocation',
+          initial: 'navigatingToLocation',
           states: {
+            navigatingToLocation: {
+              on: {
+                ARRIVED_AT_LOCATION: 'scanningLocation',
+              },
+            },
             scanningLocation: {
               on: {
-                LOCATION_CONFIRMED: 'scanningItem',
+                LOCATION_CONFIRMED: 'scanningSku',
                 WRONG_LOCATION: 'exception',
               },
             },
-            scanningItem: {
+            scanningSku: {
               on: {
-                ITEM_SCANNED: [
-                  {
-                    guard: 'allRequiredItemsScanned',
-                    target: 'complete',
-                  },
-                  {
-                    target: 'scanningLocation',
-                  },
-                ],
+                SKU_CONFIRMED: 'checkingQuantity',
+                WRONG_SKU: 'exception',
                 ITEM_DAMAGED: 'exception',
               },
             },
-            exception: {
+            checkingQuantity: {
               on: {
-                SUBSTITUTE_APPROVED: 'scanningLocation',
+                QUANTITY_CONFIRMED: 'droppingToTote',
+                QUANTITY_MISMATCH: 'exception',
+              },
+            },
+            droppingToTote: {
+              on: {
+                TOTE_CONFIRMED: 'decidingNextPick',
+                WRONG_TOTE: 'exception',
+              },
+            },
+            decidingNextPick: {
+              on: {
+                MORE_ITEMS_REQUIRED: 'navigatingToLocation',
+                ALL_ITEMS_PICKED: 'complete',
+              },
+            },
+            exception: {
+              entry: 'recordPickException',
+              on: {
+                SUBSTITUTE_APPROVED: 'navigatingToLocation',
+                RECOUNT_APPROVED: 'checkingQuantity',
                 ESCALATE_TO_SUPERVISOR:
                   '#enterpriseFulfillment.picking.supervisorReview',
               },
@@ -193,6 +278,7 @@ export const fulfillmentMachine = createMachine({
         supervisorReview: {
           on: {
             RESOLVE_PICK_EXCEPTION: 'inProgress',
+            REQUEUE_PICK: 'waveQueued',
             ABORT_PICK: '#enterpriseFulfillment.failed',
           },
         },
@@ -203,18 +289,37 @@ export const fulfillmentMachine = createMachine({
       onDone: 'qualityGate',
     },
     qualityGate: {
-      description: 'Validate picked goods before packing.',
+      description:
+        'Run scan, count, damage, and compliance checks before allowing packing.',
       initial: 'awaitingScan',
       states: {
         awaitingScan: {
           on: {
-            QA_SCAN_STARTED: 'checking',
+            QA_SCAN_STARTED: 'countingItems',
           },
         },
-        checking: {
+        countingItems: {
           on: {
-            QA_PASSED: 'passed',
-            QA_FAILED: 'manualReview',
+            ITEM_COUNT_MATCHED: 'inspectingDamage',
+            ITEM_COUNT_MISMATCHED: 'manualReview',
+          },
+        },
+        inspectingDamage: {
+          on: {
+            NO_DAMAGE_FOUND: 'checkingCompliance',
+            DAMAGE_FOUND: 'manualReview',
+          },
+        },
+        checkingCompliance: {
+          on: {
+            COMPLIANCE_PASSED: 'passed',
+            COMPLIANCE_HOLD_REQUIRED: 'complianceHold',
+          },
+        },
+        complianceHold: {
+          on: {
+            COMPLIANCE_RELEASED: 'passed',
+            COMPLIANCE_REJECTED: '#enterpriseFulfillment.failed',
           },
         },
         manualReview: {
@@ -231,18 +336,41 @@ export const fulfillmentMachine = createMachine({
       onDone: 'packing',
     },
     packing: {
-      description: 'Prepare parcel and documents in parallel.',
+      description:
+        'Prepare parcel materials, pack items, and produce shipping documents in parallel.',
       type: 'parallel',
       states: {
         parcel: {
-          initial: 'selectingCarton',
+          initial: 'measuringItems',
           states: {
-            selectingCarton: {
+            measuringItems: {
               on: {
-                CARTON_SELECTED: 'packingItems',
+                MEASUREMENTS_CAPTURED: 'selectingCarton',
               },
             },
-            packingItems: {
+            selectingCarton: {
+              on: {
+                CARTON_SELECTED: 'addingDunnage',
+                NO_CARTON_AVAILABLE: '#enterpriseFulfillment.failed',
+              },
+            },
+            addingDunnage: {
+              on: {
+                DUNNAGE_ADDED: 'placingItems',
+              },
+            },
+            placingItems: {
+              on: {
+                ITEMS_PLACED: 'weighingParcel',
+              },
+            },
+            weighingParcel: {
+              on: {
+                PARCEL_WEIGHT_CAPTURED: 'sealingParcel',
+                WEIGHT_OUT_OF_RANGE: '#enterpriseFulfillment.qualityGate',
+              },
+            },
+            sealingParcel: {
               on: {
                 PARCEL_SEALED: 'sealed',
               },
@@ -263,8 +391,14 @@ export const fulfillmentMachine = createMachine({
             },
             generatingDocuments: {
               on: {
-                DOCUMENTS_READY: 'ready',
+                DOCUMENTS_GENERATED: 'validatingDocuments',
                 DOCUMENTS_FAILED: '#enterpriseFulfillment.failed',
+              },
+            },
+            validatingDocuments: {
+              on: {
+                DOCUMENTS_VALID: 'ready',
+                DOCUMENTS_INVALID: 'generatingDocuments',
               },
             },
             ready: {
@@ -279,9 +413,16 @@ export const fulfillmentMachine = createMachine({
       },
     },
     shipping: {
-      description: 'Buy a label, wait for pickup, and track delivery.',
-      initial: 'selectingCarrier',
+      description:
+        'Shop rates, buy a label, manifest the parcel, hand it to the carrier, and track delivery.',
+      initial: 'shoppingRates',
       states: {
+        shoppingRates: {
+          on: {
+            RATES_RECEIVED: 'selectingCarrier',
+            RATE_SHOP_FAILED: 'manualCarrierSelection',
+          },
+        },
         selectingCarrier: {
           on: {
             CARRIER_SELECTED: 'purchasingLabel',
@@ -291,17 +432,31 @@ export const fulfillmentMachine = createMachine({
         manualCarrierSelection: {
           on: {
             CARRIER_SELECTED: 'purchasingLabel',
+            CANCEL_SHIPMENT: '#enterpriseFulfillment.cancelled',
           },
         },
         purchasingLabel: {
           on: {
-            LABEL_PURCHASED: 'awaitingPickup',
+            LABEL_PURCHASED: 'printingLabel',
             LABEL_PURCHASE_FAILED: 'labelRetryDelay',
           },
         },
         labelRetryDelay: {
+          entry: 'recordLabelRetry',
           after: {
             5000: 'purchasingLabel',
+          },
+        },
+        printingLabel: {
+          on: {
+            LABEL_PRINTED: 'manifestingParcel',
+            LABEL_PRINT_FAILED: 'manualCarrierSelection',
+          },
+        },
+        manifestingParcel: {
+          on: {
+            PARCEL_MANIFESTED: 'awaitingPickup',
+            MANIFEST_FAILED: '#enterpriseFulfillment.failed',
           },
         },
         awaitingPickup: {
@@ -318,6 +473,12 @@ export const fulfillmentMachine = createMachine({
         },
         inTransit: {
           on: {
+            OUT_FOR_DELIVERY: 'outForDelivery',
+            DELIVERY_EXCEPTION: 'deliveryException',
+          },
+        },
+        outForDelivery: {
+          on: {
             DELIVERY_CONFIRMED: 'delivered',
             DELIVERY_EXCEPTION: 'deliveryException',
           },
@@ -329,6 +490,44 @@ export const fulfillmentMachine = createMachine({
           },
         },
         delivered: {
+          type: 'final',
+        },
+      },
+      onDone: 'settlement',
+    },
+    settlement: {
+      description:
+        'Capture payment, close accounting, notify customer, and archive the workflow.',
+      initial: 'capturingPayment',
+      states: {
+        capturingPayment: {
+          on: {
+            PAYMENT_CAPTURED: 'closingAccounting',
+            PAYMENT_CAPTURE_FAILED: 'financeReview',
+          },
+        },
+        financeReview: {
+          on: {
+            FINANCE_APPROVED: 'closingAccounting',
+            FINANCE_REJECTED: '#enterpriseFulfillment.failed',
+          },
+        },
+        closingAccounting: {
+          on: {
+            ACCOUNTING_CLOSED: 'notifyingCustomer',
+          },
+        },
+        notifyingCustomer: {
+          on: {
+            CUSTOMER_NOTIFIED: 'archiving',
+          },
+        },
+        archiving: {
+          on: {
+            WORKFLOW_ARCHIVED: 'complete',
+          },
+        },
+        complete: {
           type: 'final',
         },
       },
