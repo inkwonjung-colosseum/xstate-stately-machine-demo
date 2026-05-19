@@ -1,0 +1,24 @@
+{
+  "name": "xstate-stately-machine-demo",
+  "version": "1.0.0",
+  "private": false,
+  "description": "A complex XState machine for testing Stately Studio GitHub import and sync.",
+  "type": "module",
+  "scripts": {
+    "check": "tsc --noEmit"
+  },
+  "keywords": [
+    "xstate",
+    "stately",
+    "state-machine",
+    "statechart"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "xstate": "^5.24.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3"
+  }
+}
+
