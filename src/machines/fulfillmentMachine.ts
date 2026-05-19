@@ -3,72 +3,51 @@ import { createMachine } from 'xstate';
 export const fulfillmentMachine = createMachine({
   id: 'enterpriseFulfillment',
   description:
-    'A complex warehouse fulfillment workflow for testing Stately Studio import from GitHub.',
+    'Import-friendly warehouse fulfillment workflow for testing Stately Studio GitHub import.',
   initial: 'intake',
   context: {
     orderId: null,
     riskScore: 0,
-    reservedSkuCount: 0,
     pickExceptions: 0,
-    labelPurchaseAttempts: 0,
-    carrier: null,
+    labelAttempts: 0,
   },
   on: {
     CUSTOMER_CANCELS: {
       target: '.cancelled',
-      actions: ['recordCustomerCancellation', 'releaseAnyHeldResources'],
+      actions: 'recordCustomerCancellation',
     },
     OPS_FORCE_FAIL: {
       target: '.failed',
-      actions: ['recordOperationalFailure', 'notifyIncidentChannel'],
+      actions: 'recordOperationalFailure',
     },
   },
   states: {
     intake: {
-      description: 'Capture, normalize, and risk-check the incoming order.',
+      description: 'Receive, validate, and approve an order.',
       initial: 'received',
       states: {
         received: {
-          entry: ['assignOrderId', 'recordOrderReceived'],
+          entry: 'recordOrderReceived',
           on: {
-            VALIDATE_ORDER: {
-              target: 'validating',
-              actions: 'normalizeOrderPayload',
-            },
+            VALIDATE_ORDER: 'validating',
           },
         },
         validating: {
-          invoke: {
-            src: 'validateOrder',
-            input: ({ context }) => ({ orderId: context.orderId }),
-            onDone: [
-              {
-                guard: 'hasHighRiskScore',
-                target: 'manualFraudReview',
-                actions: 'storeValidationResult',
-              },
-              {
-                target: 'accepted',
-                actions: 'storeValidationResult',
-              },
-            ],
-            onError: {
-              target: 'rejected',
-              actions: 'storeValidationError',
-            },
+          on: {
+            ORDER_VALID: 'riskCheck',
+            ORDER_INVALID: 'rejected',
+          },
+        },
+        riskCheck: {
+          on: {
+            LOW_RISK: 'accepted',
+            HIGH_RISK: 'manualFraudReview',
           },
         },
         manualFraudReview: {
-          description: 'Human approval lane for suspicious orders.',
           on: {
-            APPROVE_RISK: {
-              target: 'accepted',
-              actions: 'recordRiskApproval',
-            },
-            REJECT_RISK: {
-              target: 'rejected',
-              actions: 'recordRiskRejection',
-            },
+            APPROVE_RISK: 'accepted',
+            REJECT_RISK: 'rejected',
           },
         },
         accepted: {
@@ -92,63 +71,34 @@ export const fulfillmentMachine = createMachine({
     },
     planning: {
       description:
-        'Reserve sellable stock and authorize payment in parallel before warehouse work starts.',
+        'Reserve inventory and authorize payment in parallel before warehouse work starts.',
       type: 'parallel',
       states: {
         inventory: {
           initial: 'checkingAvailability',
           states: {
             checkingAvailability: {
-              invoke: {
-                src: 'checkInventory',
-                onDone: [
-                  {
-                    guard: 'allItemsAvailable',
-                    target: 'reservingStock',
-                    actions: 'storeAvailableInventory',
-                  },
-                  {
-                    target: 'waitingForReplenishment',
-                    actions: 'createBackorderRequest',
-                  },
-                ],
-                onError: {
-                  target: 'inventoryServiceUnavailable',
-                  actions: 'recordInventoryLookupFailure',
-                },
+              on: {
+                INVENTORY_AVAILABLE: 'reservingStock',
+                INVENTORY_SHORT: 'waitingForReplenishment',
+                INVENTORY_LOOKUP_FAILED: 'inventoryServiceUnavailable',
               },
             },
             inventoryServiceUnavailable: {
               after: {
-                RETRY_INVENTORY_LOOKUP: {
-                  target: 'checkingAvailability',
-                  actions: 'incrementInventoryLookupRetry',
-                },
+                3000: 'checkingAvailability',
               },
             },
             waitingForReplenishment: {
               on: {
-                STOCK_REPLENISHED: {
-                  target: 'checkingAvailability',
-                  actions: 'recordReplenishment',
-                },
-                BACKORDER_TIMEOUT: {
-                  target: '#enterpriseFulfillment.failed',
-                  actions: 'notifyBackorderExpired',
-                },
+                STOCK_REPLENISHED: 'checkingAvailability',
+                BACKORDER_TIMEOUT: '#enterpriseFulfillment.failed',
               },
             },
             reservingStock: {
-              invoke: {
-                src: 'reserveInventory',
-                onDone: {
-                  target: 'reserved',
-                  actions: 'storeReservation',
-                },
-                onError: {
-                  target: 'reservationConflict',
-                  actions: 'recordReservationConflict',
-                },
+              on: {
+                STOCK_RESERVED: 'reserved',
+                RESERVATION_CONFLICT: 'reservationConflict',
               },
             },
             reservationConflict: {
@@ -166,28 +116,15 @@ export const fulfillmentMachine = createMachine({
           initial: 'authorizing',
           states: {
             authorizing: {
-              invoke: {
-                src: 'authorizePayment',
-                onDone: {
-                  target: 'authorized',
-                  actions: 'storePaymentAuthorization',
-                },
-                onError: {
-                  target: 'requiresCustomerAction',
-                  actions: 'requestPaymentUpdate',
-                },
+              on: {
+                PAYMENT_AUTHORIZED: 'authorized',
+                PAYMENT_ACTION_REQUIRED: 'requiresCustomerAction',
               },
             },
             requiresCustomerAction: {
               on: {
-                CUSTOMER_UPDATED_PAYMENT: {
-                  target: 'authorizing',
-                  actions: 'storeUpdatedPaymentMethod',
-                },
-                PAYMENT_WINDOW_EXPIRED: {
-                  target: '#enterpriseFulfillment.cancelled',
-                  actions: 'recordPaymentWindowExpired',
-                },
+                CUSTOMER_UPDATED_PAYMENT: 'authorizing',
+                PAYMENT_WINDOW_EXPIRED: '#enterpriseFulfillment.cancelled',
               },
             },
             authorized: {
@@ -202,28 +139,18 @@ export const fulfillmentMachine = createMachine({
       },
     },
     picking: {
-      description: 'Warehouse execution lane for assigning and completing pick work.',
+      description: 'Assign warehouse work and resolve scan exceptions.',
       initial: 'waveQueued',
       states: {
         waveQueued: {
           on: {
-            WAVE_RELEASED: {
-              target: 'assigningPicker',
-              actions: 'attachWaveId',
-            },
+            WAVE_RELEASED: 'assigningPicker',
           },
         },
         assigningPicker: {
-          invoke: {
-            src: 'assignPicker',
-            onDone: {
-              target: 'inProgress',
-              actions: 'storePickerAssignment',
-            },
-            onError: {
-              target: 'supervisorReview',
-              actions: 'recordPickerAssignmentFailure',
-            },
+          on: {
+            PICKER_ASSIGNED: 'inProgress',
+            PICKER_ASSIGNMENT_FAILED: 'supervisorReview',
           },
         },
         inProgress: {
@@ -232,10 +159,7 @@ export const fulfillmentMachine = createMachine({
             scanningLocation: {
               on: {
                 LOCATION_CONFIRMED: 'scanningItem',
-                WRONG_LOCATION: {
-                  target: 'exception',
-                  actions: 'recordWrongLocationScan',
-                },
+                WRONG_LOCATION: 'exception',
               },
             },
             scanningItem: {
@@ -244,26 +168,19 @@ export const fulfillmentMachine = createMachine({
                   {
                     guard: 'allRequiredItemsScanned',
                     target: 'complete',
-                    actions: 'recordFinalItemScan',
                   },
                   {
                     target: 'scanningLocation',
-                    actions: 'recordItemScan',
                   },
                 ],
-                ITEM_DAMAGED: {
-                  target: 'exception',
-                  actions: 'recordDamagedItem',
-                },
+                ITEM_DAMAGED: 'exception',
               },
             },
             exception: {
               on: {
-                SUBSTITUTE_APPROVED: {
-                  target: 'scanningLocation',
-                  actions: 'applySubstitution',
-                },
-                ESCALATE_TO_SUPERVISOR: '#enterpriseFulfillment.picking.supervisorReview',
+                SUBSTITUTE_APPROVED: 'scanningLocation',
+                ESCALATE_TO_SUPERVISOR:
+                  '#enterpriseFulfillment.picking.supervisorReview',
               },
             },
             complete: {
@@ -275,14 +192,8 @@ export const fulfillmentMachine = createMachine({
         },
         supervisorReview: {
           on: {
-            RESOLVE_PICK_EXCEPTION: {
-              target: 'inProgress',
-              actions: 'recordSupervisorResolution',
-            },
-            ABORT_PICK: {
-              target: '#enterpriseFulfillment.failed',
-              actions: 'recordPickAbort',
-            },
+            RESOLVE_PICK_EXCEPTION: 'inProgress',
+            ABORT_PICK: '#enterpriseFulfillment.failed',
           },
         },
         picked: {
@@ -301,35 +212,16 @@ export const fulfillmentMachine = createMachine({
           },
         },
         checking: {
-          invoke: {
-            src: 'runQualityInspection',
-            onDone: [
-              {
-                guard: 'qualityInspectionPassed',
-                target: 'passed',
-                actions: 'recordQualityPass',
-              },
-              {
-                target: 'manualReview',
-                actions: 'recordQualityIssue',
-              },
-            ],
+          on: {
+            QA_PASSED: 'passed',
+            QA_FAILED: 'manualReview',
           },
         },
         manualReview: {
           on: {
-            QA_OVERRIDE_APPROVED: {
-              target: 'passed',
-              actions: 'recordQualityOverride',
-            },
-            QA_REWORK_REQUIRED: {
-              target: '#enterpriseFulfillment.picking',
-              actions: 'sendBackToPicking',
-            },
-            QA_REJECTED: {
-              target: '#enterpriseFulfillment.failed',
-              actions: 'recordQualityRejection',
-            },
+            QA_OVERRIDE_APPROVED: 'passed',
+            QA_REWORK_REQUIRED: '#enterpriseFulfillment.picking',
+            QA_REJECTED: '#enterpriseFulfillment.failed',
           },
         },
         passed: {
@@ -339,8 +231,7 @@ export const fulfillmentMachine = createMachine({
       onDone: 'packing',
     },
     packing: {
-      description:
-        'Prepare parcel materials and compliance documents in parallel before buying a label.',
+      description: 'Prepare parcel and documents in parallel.',
       type: 'parallel',
       states: {
         parcel: {
@@ -348,18 +239,12 @@ export const fulfillmentMachine = createMachine({
           states: {
             selectingCarton: {
               on: {
-                CARTON_SELECTED: {
-                  target: 'packingItems',
-                  actions: 'storeCartonChoice',
-                },
+                CARTON_SELECTED: 'packingItems',
               },
             },
             packingItems: {
               on: {
-                PARCEL_SEALED: {
-                  target: 'sealed',
-                  actions: 'recordParcelWeight',
-                },
+                PARCEL_SEALED: 'sealed',
               },
             },
             sealed: {
@@ -371,27 +256,15 @@ export const fulfillmentMachine = createMachine({
           initial: 'checkingRequirements',
           states: {
             checkingRequirements: {
-              always: [
-                {
-                  guard: 'requiresCustomsDocuments',
-                  target: 'generatingCustomsDocs',
-                },
-                {
-                  target: 'ready',
-                },
-              ],
+              on: {
+                DOCUMENTS_REQUIRED: 'generatingDocuments',
+                DOCUMENTS_NOT_REQUIRED: 'ready',
+              },
             },
-            generatingCustomsDocs: {
-              invoke: {
-                src: 'generateCustomsDocuments',
-                onDone: {
-                  target: 'ready',
-                  actions: 'storeDocumentIds',
-                },
-                onError: {
-                  target: '#enterpriseFulfillment.failed',
-                  actions: 'recordDocumentGenerationFailure',
-                },
+            generatingDocuments: {
+              on: {
+                DOCUMENTS_READY: 'ready',
+                DOCUMENTS_FAILED: '#enterpriseFulfillment.failed',
               },
             },
             ready: {
@@ -406,102 +279,53 @@ export const fulfillmentMachine = createMachine({
       },
     },
     shipping: {
-      description: 'Buy a carrier label, hand over the parcel, and track delivery.',
+      description: 'Buy a label, wait for pickup, and track delivery.',
       initial: 'selectingCarrier',
       states: {
         selectingCarrier: {
-          invoke: {
-            src: 'selectCarrier',
-            onDone: {
-              target: 'purchasingLabel',
-              actions: 'storeCarrier',
-            },
-            onError: {
-              target: 'manualCarrierSelection',
-              actions: 'recordCarrierSelectionFailure',
-            },
+          on: {
+            CARRIER_SELECTED: 'purchasingLabel',
+            CARRIER_SELECTION_FAILED: 'manualCarrierSelection',
           },
         },
         manualCarrierSelection: {
           on: {
-            CARRIER_SELECTED: {
-              target: 'purchasingLabel',
-              actions: 'storeManualCarrier',
-            },
+            CARRIER_SELECTED: 'purchasingLabel',
           },
         },
         purchasingLabel: {
-          invoke: {
-            src: 'purchaseShippingLabel',
-            onDone: {
-              target: 'awaitingPickup',
-              actions: 'storePurchasedLabel',
-            },
-            onError: [
-              {
-                guard: 'canRetryLabelPurchase',
-                target: 'labelRetryDelay',
-                actions: 'recordLabelPurchaseRetry',
-              },
-              {
-                target: 'manualCarrierSelection',
-                actions: 'recordLabelPurchaseFailure',
-              },
-            ],
+          on: {
+            LABEL_PURCHASED: 'awaitingPickup',
+            LABEL_PURCHASE_FAILED: 'labelRetryDelay',
           },
         },
         labelRetryDelay: {
           after: {
-            RETRY_LABEL_PURCHASE: 'purchasingLabel',
+            5000: 'purchasingLabel',
           },
         },
         awaitingPickup: {
           on: {
-            CARRIER_SCANNED_PARCEL: {
-              target: 'inTransit',
-              actions: 'recordCarrierHandoff',
-            },
-            PICKUP_MISSED: {
-              target: 'reschedulingPickup',
-              actions: 'recordMissedPickup',
-            },
+            CARRIER_SCANNED_PARCEL: 'inTransit',
+            PICKUP_MISSED: 'reschedulingPickup',
           },
         },
         reschedulingPickup: {
-          invoke: {
-            src: 'reschedulePickup',
-            onDone: {
-              target: 'awaitingPickup',
-              actions: 'storePickupWindow',
-            },
-            onError: {
-              target: '#enterpriseFulfillment.failed',
-              actions: 'recordPickupRescheduleFailure',
-            },
+          on: {
+            PICKUP_RESCHEDULED: 'awaitingPickup',
+            PICKUP_RESCHEDULE_FAILED: '#enterpriseFulfillment.failed',
           },
         },
         inTransit: {
           on: {
-            DELIVERY_CONFIRMED: {
-              target: 'delivered',
-              actions: 'recordDelivery',
-            },
-            DELIVERY_EXCEPTION: {
-              target: 'deliveryException',
-              actions: 'recordDeliveryException',
-            },
+            DELIVERY_CONFIRMED: 'delivered',
+            DELIVERY_EXCEPTION: 'deliveryException',
           },
         },
         deliveryException: {
           on: {
-            RESOLVE_DELIVERY_EXCEPTION: {
-              target: 'inTransit',
-              actions: 'recordDeliveryExceptionResolution',
-            },
-            RETURN_TO_SENDER: {
-              target: '#enterpriseFulfillment.failed',
-              actions: 'recordReturnToSender',
-            },
+            RESOLVE_DELIVERY_EXCEPTION: 'inTransit',
+            RETURN_TO_SENDER: '#enterpriseFulfillment.failed',
           },
         },
         delivered: {
@@ -512,15 +336,15 @@ export const fulfillmentMachine = createMachine({
     },
     completed: {
       type: 'final',
-      entry: ['capturePayment', 'publishFulfillmentComplete'],
+      entry: 'publishFulfillmentComplete',
     },
     cancelled: {
       type: 'final',
-      entry: ['voidPaymentAuthorization', 'releaseInventoryReservation'],
+      entry: 'releaseHeldResources',
     },
     failed: {
       type: 'final',
-      entry: ['openOpsIncident', 'releaseAnyHeldResources'],
+      entry: 'openOpsIncident',
     },
   },
 });
