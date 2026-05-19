@@ -22,13 +22,13 @@ src/machines/fulfillmentMachine.ts
 GitHub URL:
 
 ```text
-https://github.com/developjik1/xstate-stately-machine-demo/blob/main/src/machines/fulfillmentMachine.ts
+https://github.com/inkwonjung-colosseum/xstate-stately-machine-demo/blob/main/src/machines/fulfillmentMachine.ts
 ```
 
 Stately import URL pattern:
 
 ```text
-https://github.stately.ai/developjik1/xstate-stately-machine-demo/blob/main/src/machines/fulfillmentMachine.ts
+https://github.stately.ai/inkwonjung-colosseum/xstate-stately-machine-demo/blob/main/src/machines/fulfillmentMachine.ts
 ```
 
 ## Local Check
@@ -41,4 +41,3 @@ npm run check
 ## Notes
 
 The machine intentionally uses a direct `createMachine({ ... })` call and string action, guard, actor, and delay names. That keeps the statechart readable for visual import while avoiding unrelated runtime implementation code.
-
